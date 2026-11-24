@@ -10,17 +10,19 @@ Numbering rules
   table of that project.
 * A split moves selected rows of one merged student onto a freshly allocated
   project student number.  All other rows keep their number.
-* Every delivery registers unique ``(project, row, student)`` items.  A split
-  scans those items for the rows it moves: if a row was successfully delivered
-  under the old number, a correction line is written in the *same transaction*.
-  Later deliveries read the row's current number and therefore need no
-  correction.
+* Every delivery registers unique ``(project, row, student)`` items and bumps
+  a per-``(row, student)`` counter in ``delivery_rollups``.  A split reads that
+  counter for each moved row and reserves one contiguous correction-id block
+  per row in ``correction_ranges``; the sheet expands the block over the
+  recorded deliveries.  Split work is therefore proportional to the moved rows,
+  not to how often they were delivered.
 * A correction line stores the original anonymous project row number and the
-  new student number, so a correction sheet is an immutable record and can be
-  fetched verbatim later.
+  new student number.  Its id is fixed when the range is reserved, so a
+  correction sheet is an immutable record and can be fetched verbatim later.
 
 Every mutation runs inside ``BEGIN IMMEDIATE``: a failure rolls back the
-reassignment, the split record and any correction lines together.
+reassignment, the split record, the correction ranges and their reserved ids
+together.
 """
 
 from __future__ import annotations
@@ -147,6 +149,73 @@ def _split_keys(conn: sqlite3.Connection, project_id: str) -> set[tuple[str, int
         (project_id,),
     ).fetchall()
     return {(r["table_name"], int(r["row_no"])) for r in rows}
+
+
+def _delivery_count_for_row(
+    conn: sqlite3.Connection,
+    project_id: str,
+    table_name: str,
+    row_no: int,
+    student_no: int,
+) -> int:
+    """How often a row was delivered under one student number.
+
+    ``delivery_rollups`` is maintained by delivery in the same transaction as
+    the delivery item, so this is a single-row read: split cost does not grow
+    with the number of deliveries the row has accumulated.
+    """
+    row = conn.execute(
+        """
+        SELECT delivery_count FROM delivery_rollups
+        WHERE project_id = ? AND table_name = ? AND row_no = ? AND student_no = ?
+        """,
+        (project_id, table_name, row_no, student_no),
+    ).fetchone()
+    return 0 if row is None else int(row["delivery_count"])
+
+
+def _ensure_correction_id_state(conn: sqlite3.Connection) -> None:
+    """Create the global allocator above every legacy correction id.
+
+    Runs once per split transaction.  When the state row already exists this is
+    a single-row read; the scan of legacy corrections happens only on volumes
+    that were not migrated by :func:`app.db.init_db`.
+    """
+    existing = conn.execute(
+        "SELECT next_id FROM correction_id_state WHERE singleton = 1"
+    ).fetchone()
+    if existing is not None:
+        return
+    conn.execute(
+        """
+        INSERT INTO correction_id_state (singleton, next_id)
+        SELECT 1, COALESCE(MAX(correction_id), 0) + 1
+        FROM legacy_correction_items
+        """
+    )
+
+
+def _reserve_correction_ids(conn: sqlite3.Connection, count: int) -> int | None:
+    """Reserve ``count`` consecutive correction numbers and return the first.
+
+    Numbers come from a global allocator seeded above every id already used by
+    legacy correction rows, so a range-format sheet can never reuse a
+    correction number that an older volume already handed out.  Called inside
+    ``BEGIN IMMEDIATE``: a failed split rolls the reservation back.
+    """
+    if count <= 0:
+        return None
+    row = conn.execute(
+        "SELECT next_id FROM correction_id_state WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        raise ApiError(500, "internal_inconsistency", "更正单编号分配器缺失")
+    first = int(row["next_id"])
+    conn.execute(
+        "UPDATE correction_id_state SET next_id = ? WHERE singleton = 1",
+        (first + count,),
+    )
+    return first
 
 
 def _validate_unique_rows(rows: list[dict[str, Any]]) -> None:
@@ -538,6 +607,19 @@ def deliver_tx(
                 now,
             ),
         )
+        # The rollup is the split-time view of "was this row delivered under
+        # this number?"; keeping it in the same transaction means a split never
+        # has to scan the delivery history.
+        conn.execute(
+            """
+            INSERT INTO delivery_rollups
+                (project_id, table_name, row_no, student_no, delivery_count)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT (project_id, table_name, row_no, student_no)
+            DO UPDATE SET delivery_count = delivery_count + 1
+            """,
+            (project_id, table_name, row_no, student_no),
+        )
 
     conn.execute(
         "UPDATE deliveries SET new_project_row_count = ? WHERE delivery_id = ?",
@@ -698,26 +780,35 @@ def _split_response(conn: sqlite3.Connection, split_id: int) -> dict[str, Any]:
         "SELECT * FROM split_rows WHERE split_id = ? ORDER BY table_name, row_no",
         (split_id,),
     ).fetchall()
+    # Which moved rows ended up with at least one correction line.  Both
+    # formats are consulted directly (not through the expanded view) so
+    # building a split receipt never has to walk the delivery history.
     correction_keys = {
         (r["table_name"], int(r["row_no"]))
         for r in conn.execute(
-            "SELECT table_name, row_no FROM correction_items WHERE split_id = ?",
-            (split_id,),
-        ).fetchall()
-    }
-    delivered_keys = {
-        (r["table_name"], int(r["row_no"]))
-        for r in conn.execute(
             """
-            SELECT table_name, row_no FROM delivery_items
-            WHERE project_id = ? AND student_no = ?
+            SELECT table_name, row_no FROM legacy_correction_items
+            WHERE split_id = ?
+            UNION
+            SELECT table_name, row_no FROM correction_ranges
+            WHERE split_id = ? AND correction_count > 0
             """,
-            (project_id, old_student_no),
+            (split_id, split_id),
         ).fetchall()
     }
     row_items = []
     for row in rows:
         key = (row["table_name"], int(row["row_no"]))
+        was_delivered = (
+            _delivery_count_for_row(
+                conn,
+                project_id,
+                key[0],
+                key[1],
+                int(row["old_student_no"]),
+            )
+            > 0
+        )
         row_items.append(
             {
                 "table_name": row["table_name"],
@@ -725,7 +816,7 @@ def _split_response(conn: sqlite3.Connection, split_id: int) -> dict[str, Any]:
                 "project_row_no": int(row["project_row_no"]),
                 "old_student_no": int(row["old_student_no"]),
                 "new_student_no": int(row["new_student_no"]),
-                "was_delivered_under_old_no": key in delivered_keys,
+                "was_delivered_under_old_no": was_delivered,
                 "correction_registered": key in correction_keys,
             }
         )
@@ -881,12 +972,14 @@ def split_student_tx(
     # ---- atomic split -----------------------------------------------------
     now = utcnow()
     new_student_no = _next_student_no(conn, project_id)
+    _ensure_correction_id_state(conn)
     cursor = conn.execute(
         """
         INSERT INTO splits
             (project_id, request_id, request_fingerprint, old_student_no,
-             new_student_no, row_count, correction_count, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+             new_student_no, row_count, correction_count, correction_format,
+             created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 'range', ?)
         """,
         (
             project_id,
@@ -968,42 +1061,36 @@ def split_student_tx(
         )
 
         # Every successfully registered delivery of this row under the old
-        # number becomes a correction line, whatever the delivery/split order:
-        # rows delivered before the split already used the old number, and a
-        # row delivered several times gets one line per delivery record.
-        delivered_items = conn.execute(
+        # number becomes a correction line, whatever the delivery/split order.
+        # The rollup counter gives that number in one read; one range records
+        # the whole block of ids for the row, so split work is proportional to
+        # the moved rows rather than to their delivery history.
+        row_correction_count = _delivery_count_for_row(
+            conn, project_id, table_name, row_no, old_student_no
+        )
+        first_correction_id = _reserve_correction_ids(conn, row_correction_count)
+        conn.execute(
             """
-            SELECT delivery_item_id, delivery_id, project_row_no
-            FROM delivery_items
-            WHERE project_id = ? AND table_name = ? AND row_no = ?
-              AND student_no = ?
-            ORDER BY delivery_item_id
+            INSERT INTO correction_ranges
+                (project_id, split_id, table_name, row_no, project_row_no,
+                 old_student_no, new_student_no, first_correction_id,
+                 correction_count, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, table_name, row_no, old_student_no),
-        ).fetchall()
-        for delivered in delivered_items:
-            conn.execute(
-                """
-                INSERT INTO correction_items
-                    (project_id, split_id, delivery_item_id, delivery_id,
-                     table_name, row_no, original_row_no, old_student_no,
-                     new_student_no, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    project_id,
-                    split_id,
-                    int(delivered["delivery_item_id"]),
-                    int(delivered["delivery_id"]),
-                    table_name,
-                    row_no,
-                    int(delivered["project_row_no"]),
-                    old_student_no,
-                    new_student_no,
-                    now,
-                ),
-            )
-            correction_count += 1
+            (
+                project_id,
+                split_id,
+                table_name,
+                row_no,
+                project_row_no,
+                old_student_no,
+                new_student_no,
+                first_correction_id,
+                row_correction_count,
+                now,
+            ),
+        )
+        correction_count += row_correction_count
 
     conn.execute(
         "UPDATE splits SET correction_count = ? WHERE split_id = ?",
@@ -1056,8 +1143,6 @@ def correction_sheet(
     delivery_id: int | None,
 ) -> dict[str, Any]:
     require_project(conn, project_id)
-    where = ["project_id = ?"]
-    params: list[Any] = [project_id]
 
     if split_id is not None:
         split = conn.execute(
@@ -1066,8 +1151,6 @@ def correction_sheet(
         ).fetchone()
         if split is None:
             raise ApiError(404, "split_not_found", "拆分记录不存在")
-        where.append("split_id = ?")
-        params.append(split_id)
 
     if delivery_id is not None:
         delivery = conn.execute(
@@ -1076,8 +1159,6 @@ def correction_sheet(
         ).fetchone()
         if delivery is None:
             raise ApiError(404, "delivery_not_found", "交付记录不存在")
-        where.append("delivery_id = ?")
-        params.append(delivery_id)
 
     if split_id is not None:
         scope = "split"
@@ -1086,16 +1167,83 @@ def correction_sheet(
     else:
         scope = "project"
 
-    rows = conn.execute(
+    # Corrections come from two storage formats.  Both queries are scoped by
+    # the requested project/split before the delivery history is touched, and
+    # each line's id is fixed independently of the delivery filter, so the
+    # same line has the same correction_id in every scope.
+    legacy_where = ["project_id = ?"]
+    legacy_params: list[Any] = [project_id]
+    if split_id is not None:
+        legacy_where.append("split_id = ?")
+        legacy_params.append(split_id)
+    if delivery_id is not None:
+        legacy_where.append("delivery_id = ?")
+        legacy_params.append(delivery_id)
+    legacy_rows = conn.execute(
         f"""
         SELECT correction_id, split_id, table_name, original_row_no,
                old_student_no, new_student_no, delivery_id, recorded_at
-        FROM correction_items
-        WHERE {' AND '.join(where)}
-        ORDER BY correction_id
+        FROM legacy_correction_items
+        WHERE {' AND '.join(legacy_where)}
         """,
-        params,
+        legacy_params,
     ).fetchall()
+
+    # Range blocks are numbered over all old-number deliveries of the row,
+    # then the delivery filter is applied outside the window.  The view
+    # ``correction_items`` documents the same rule for ad-hoc queries.
+    numbered_where = ["cr.project_id = ?", "cr.correction_count > 0"]
+    numbered_params: list[Any] = [project_id]
+    if split_id is not None:
+        numbered_where.append("cr.split_id = ?")
+        numbered_params.append(split_id)
+    delivery_filter = ""
+    if delivery_id is not None:
+        # Narrow to ranges whose row this delivery actually covered before the
+        # window is evaluated.  The window still counts *all* old-number
+        # deliveries of those rows, so the numbering matches other scopes.
+        numbered_where.append(
+            """
+            EXISTS (
+                SELECT 1 FROM delivery_items dx
+                WHERE dx.project_id = cr.project_id
+                  AND dx.table_name = cr.table_name
+                  AND dx.row_no = cr.row_no
+                  AND dx.student_no = cr.old_student_no
+                  AND dx.delivery_id = ?
+            )
+            """
+        )
+        numbered_params.append(delivery_id)
+        delivery_filter = "WHERE delivery_id = ?"
+        numbered_params.append(delivery_id)
+    range_rows = conn.execute(
+        f"""
+        WITH numbered AS (
+            SELECT cr.split_id,
+                   cr.table_name,
+                   cr.project_row_no AS original_row_no,
+                   cr.old_student_no,
+                   cr.new_student_no,
+                   cr.recorded_at,
+                   di.delivery_id,
+                   cr.first_correction_id + ROW_NUMBER() OVER (
+                       PARTITION BY cr.correction_range_id
+                       ORDER BY di.delivery_item_id
+                   ) - 1 AS correction_id
+            FROM correction_ranges cr
+            JOIN delivery_items di
+              ON di.project_id = cr.project_id
+             AND di.table_name = cr.table_name
+             AND di.row_no = cr.row_no
+             AND di.student_no = cr.old_student_no
+            WHERE {' AND '.join(numbered_where)}
+        )
+        SELECT * FROM numbered {delivery_filter} ORDER BY correction_id
+        """,
+        numbered_params,
+    ).fetchall()
+
     lines = [
         {
             "correction_id": int(r["correction_id"]),
@@ -1107,7 +1255,10 @@ def correction_sheet(
             "delivery_id": int(r["delivery_id"]),
             "recorded_at": r["recorded_at"],
         }
-        for r in rows
+        for r in sorted(
+            [*legacy_rows, *range_rows],
+            key=lambda r: int(r["correction_id"]),
+        )
     ]
     return {
         "project_id": project_id,

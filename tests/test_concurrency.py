@@ -216,3 +216,56 @@ def test_failed_split_rolls_back_counters_and_student_numbers(tmp_path):
         assert sheet["line_count"] == 1
     finally:
         conn.close()
+
+
+def test_concurrent_repeat_deliveries_then_split_yields_one_line_each(tmp_path):
+    """Repeated deliveries racing with a split produce a consistent sheet."""
+    db_path = str(tmp_path / "repeat-race.db")
+    project_id = _seed(db_path)
+
+    def worker(index: int) -> None:
+        conn = connect(db_path)
+        try:
+            service.deliver(
+                conn,
+                project_id,
+                [{"table_name": "assessment", "row_no": 10}],
+                request_id=f"deliver-{index}",
+            )
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    conn = connect(db_path)
+    try:
+        result = service.split_student(
+            conn,
+            project_id,
+            "S1",
+            [{"table_name": "assessment", "row_no": 10}],
+            None,
+        )
+        assert result["correction_count"] == 5
+        sheet = service.correction_sheet(conn, project_id, None, None)
+        assert sheet["line_count"] == 5
+        ids = [line["correction_id"] for line in sheet["lines"]]
+        assert len(set(ids)) == 5
+        assert ids == sorted(ids)
+        # Deliver after the split: no extra line, new student number.
+        after = service.deliver(
+            conn,
+            project_id,
+            [{"table_name": "assessment", "row_no": 10}],
+            request_id="after",
+        )
+        assert after["items"][0]["student_no"] == result["new_student_no"]
+        assert service.correction_sheet(
+            conn, project_id, None, None
+        )["line_count"] == 5
+    finally:
+        conn.close()
